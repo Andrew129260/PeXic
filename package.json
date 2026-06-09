@@ -1,0 +1,25 @@
+{
+    "author": "andrew129260@gmail.com",
+    "dependencies": {},
+    "keywords": [],
+    "name": "pexic",
+    "pebble": {
+        "displayName": "Pexic",
+        "enableMultiJS": true,
+        "messageKeys": [],
+        "projectType": "native",
+        "resources": {
+            "media": []
+        },
+        "sdkVersion": "3",
+        "targetPlatforms": [
+            "emery",
+            "gabbro"
+        ],
+        "uuid": "5311bd1b-08f4-40d7-ab1d-8b14389141a8",
+        "watchapp": {
+            "watchface": false
+        }
+    },
+    "version": "1.0.0"
+}
