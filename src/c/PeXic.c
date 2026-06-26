@@ -415,7 +415,7 @@ static void apply_gravity() {
         bool safe_spawn_zone = (q > 0 && q < GRID_COLS - 1 && r > 0 && r < GRID_ROWS - 1);
         
         if (safe_spawn_zone && current_bombs < max_bombs && (rand() % 100 < 5)) {
-            s_bomb_timers[q][r] = 15;
+            s_bomb_timers[q][r] = 8; // Faster, more dangerous bombs for small screens
             current_bombs++; 
         } else {
             s_bomb_timers[q][r] = 0;
@@ -471,9 +471,12 @@ static void tick_bombs() {
   for(int r = 0; r < GRID_ROWS; r++) {
     for(int q = 0; q < GRID_COLS; q++) {
       if (s_bomb_timers[q][r] > 0) {
-        if (--s_bomb_timers[q][r] == 0) {
-          s_game_over = true;
-          s_bomb_timers[q][r] = -1; 
+        // Prevent unfair Game Overs: Don't explode a bomb if it is already caught in a match
+        if (!s_marked_for_deletion[q][r]) {
+          if (--s_bomb_timers[q][r] == 0) {
+            s_game_over = true;
+            s_bomb_timers[q][r] = -1; 
+          }
         }
       }
     }
@@ -501,9 +504,23 @@ static void anim_stopped_callback(Animation *anim, bool finished, void *context)
   
   if (finished) {
     rotate_cluster(s_active_cursor_idx, s_anim_clockwise);
+    
+    // Evaluate matches FIRST, then tick bombs, so players aren't killed unfairly
+    bool made_flower = detect_flowers();
+    bool made_match = (!made_flower) ? detect_matches() : false;
+    
     tick_bombs();
-    if (!s_game_over) detect_matches_and_cascade();
-    layer_mark_dirty(s_grid_layer);
+    
+    if (made_flower || made_match) {
+      s_is_cascading = true; 
+      start_destruct_animation(); 
+    } else {
+      s_is_cascading = false; 
+      if (!s_game_over && !has_valid_moves()) {
+        s_game_over = true;
+      }
+      layer_mark_dirty(s_grid_layer);
+    }
   }
   
   animation_destroy(s_rotation_anim); s_rotation_anim = NULL;
@@ -532,12 +549,13 @@ static void handle_touch_event(int touch_x, int touch_y) {
     if (dist < min_dist) { min_dist = dist; closest_idx = i; }
   }
   
-  if (closest_idx != -1) {
+  // Anti-stray touch: Tap must be physically near the board (within ~60 pixels squared)
+  if (closest_idx != -1 && min_dist < 4000) {
     if (s_active_cursor_idx == closest_idx) {
-      // It's already selected, so spin it
+      // Tap 2: It's already selected, so spin it
       start_rotation_animation(true);
     } else {
-      // Not selected yet, move cursor here
+      // Tap 1: Not selected yet, move cursor here
       s_active_cursor_idx = closest_idx;
       layer_mark_dirty(s_grid_layer);
     }
@@ -550,10 +568,15 @@ static void splash_update_proc(Layer *layer, GContext *ctx) {
 
   int cx = bounds.size.w / 2;
   int cy = bounds.size.h / 4;
+#if defined(PBL_ROUND)
+  cy += 15; // Shift logo down slightly to avoid the Gabbro top hardware curve
+#endif
+  
   int title_y = cy + (s_hex_h / 2) + 5;
   int menu_y = title_y + 45;
 
   // Draw 3 connected logo hexes
+  graphics_context_set_antialiased(ctx, true);
   draw_hex(ctx, cx, cy - s_hex_h*3/8, 2); 
   draw_hex(ctx, cx - s_hex_w/2, cy + s_hex_h*3/8, 1); 
   draw_hex(ctx, cx + s_hex_w/2, cy + s_hex_h*3/8, 3); 
@@ -683,6 +706,7 @@ static void game_click_config_provider(void *context) {
 static void grid_update_proc(Layer *layer, GContext *ctx) {
   CursorPos c = s_cursors[s_active_cursor_idx];
   GRect bounds = layer_get_bounds(layer);
+  graphics_context_set_antialiased(ctx, true);
 
   // 1. Draw Dummy Bezel Hexes
   for (int r = -2; r < GRID_ROWS + 2; r++) {
@@ -777,11 +801,8 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
     }
   }
 
-  // 4. Draw UI Cursor Highlight
+  // 4. Draw UI Cursor Highlight (Double-Stroke Shadow for high visibility)
   if (!s_is_animating && !s_is_cascading && !s_game_over && !s_is_destructing) {
-    graphics_context_set_stroke_width(ctx, 3);
-    graphics_context_set_stroke_color(ctx, GColorYellow);
-    
     int cx[3] = {
       s_x_off + c.hex_a.q * s_hex_w + (c.hex_a.r % 2) * (s_hex_w / 2),
       s_x_off + c.hex_b.q * s_hex_w + (c.hex_b.r % 2) * (s_hex_w / 2),
@@ -792,6 +813,18 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
       s_y_off + c.hex_b.r * (s_hex_h * 3 / 4),
       s_y_off + c.hex_c.r * (s_hex_h * 3 / 4)
     };
+
+    // Thick Black Drop-Shadow
+    graphics_context_set_stroke_width(ctx, 5);
+    graphics_context_set_stroke_color(ctx, GColorBlack);
+    for(int i=0; i<3; i++) {
+      gpath_move_to(s_hex_path, GPoint(cx[i], cy[i]));
+      gpath_draw_outline(ctx, s_hex_path);
+    }
+    
+    // Bright Yellow Inner Line
+    graphics_context_set_stroke_width(ctx, 3);
+    graphics_context_set_stroke_color(ctx, GColorYellow);
     for(int i=0; i<3; i++) {
       gpath_move_to(s_hex_path, GPoint(cx[i], cy[i]));
       gpath_draw_outline(ctx, s_hex_path);
@@ -799,9 +832,9 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
     
     graphics_context_set_stroke_width(ctx, 1);
     graphics_context_set_fill_color(ctx, GColorWhite);
-    graphics_fill_circle(ctx, GPoint(c.pixel_x, c.pixel_y), 4);
+    graphics_fill_circle(ctx, GPoint(c.pixel_x, c.pixel_y), 5);
     graphics_context_set_stroke_color(ctx, GColorBlack);
-    graphics_draw_circle(ctx, GPoint(c.pixel_x, c.pixel_y), 4);
+    graphics_draw_circle(ctx, GPoint(c.pixel_x, c.pixel_y), 5);
   }
 
   // 5. Draw the Black Score Header
