@@ -533,8 +533,14 @@ static void handle_touch_event(int touch_x, int touch_y) {
   }
   
   if (closest_idx != -1) {
-    s_active_cursor_idx = closest_idx;
-    start_rotation_animation(true);
+    if (s_active_cursor_idx == closest_idx) {
+      // It's already selected, so spin it
+      start_rotation_animation(true);
+    } else {
+      // Not selected yet, move cursor here
+      s_active_cursor_idx = closest_idx;
+      layer_mark_dirty(s_grid_layer);
+    }
   }
 }
 
@@ -707,7 +713,11 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
         graphics_fill_circle(ctx, GPoint(x, y), s_current_destruct_radius);
         graphics_context_set_stroke_width(ctx, 2);
         graphics_context_set_stroke_color(ctx, GColorWhite);
-        graphics_draw_circle(ctx, GPoint(x, y), s_destruct_max - s_current_destruct_radius + 2);
+#if defined(PBL_ROUND)
+        graphics_draw_circle(ctx, GPoint(x, y), 18 - s_current_destruct_radius + 2);
+#else
+        graphics_draw_circle(ctx, GPoint(x, y), 16 - s_current_destruct_radius + 2);
+#endif
         graphics_context_set_stroke_width(ctx, 1);
       } else {
         draw_hex(ctx, x, y, s_board[q][r]);
@@ -875,12 +885,16 @@ static void game_window_unload(Window *window) {
 
 static void init() {
   srand(time(NULL)); 
+  
+  // Set up Hex Path once
   s_hex_path = gpath_create(&HEX_PATH_INFO);
   
+  // Initialize game state (Runs exactly once to prevent overwriting saves mid-session)
   init_cursors(); 
   init_board(false); 
   s_active_cursor_idx = s_cursor_count / 2;
 
+  // Splash Window
   s_splash_window = window_create();
   window_set_background_color(s_splash_window, GColorOxfordBlue);
   window_set_window_handlers(s_splash_window, (WindowHandlers) {
@@ -890,6 +904,7 @@ static void init() {
   });
   window_set_click_config_provider(s_splash_window, splash_click_config_provider);
   
+  // Game Window
   s_game_window = window_create();
   window_set_background_color(s_game_window, GColorOxfordBlue);
   window_set_window_handlers(s_game_window, (WindowHandlers) {
@@ -907,6 +922,18 @@ static void init() {
 }
 
 static void deinit() { 
+  if (s_cascade_timer) {
+    app_timer_cancel(s_cascade_timer);
+    s_cascade_timer = NULL;
+  }
+  if (s_rotation_anim) {
+    animation_unschedule(s_rotation_anim);
+  }
+  if (s_destruct_anim) {
+    animation_unschedule(s_destruct_anim);
+  }
+
+  // Save the progress
   SaveState state = {
     .version = SAVE_VERSION,
     .score = s_score,

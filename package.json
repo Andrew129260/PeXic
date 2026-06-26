@@ -9,7 +9,21 @@
         "messageKeys": [],
         "projectType": "native",
         "resources": {
-            "media": []
+            "media": [
+                {
+                    "file": "images/pexicappicon16.png",
+                    "name": "pexicappicon16",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                },
+                {
+                    "file": "images/pexicappicon25.png",
+                    "menuIcon": true,
+                    "name": "pexicappicon25",
+                    "targetPlatforms": null,
+                    "type": "bitmap"
+                }
+            ]
         },
         "sdkVersion": "3",
         "targetPlatforms": [
@@ -21,5 +35,5 @@
             "watchface": false
         }
     },
-    "version": "2.0.0"
+    "version": "2.2.0"
 }
