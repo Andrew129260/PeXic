@@ -23,10 +23,21 @@ typedef struct {
   bool used_retry;
 } __attribute__((__packed__)) SaveState;
 
+typedef enum {
+  GAME_OVER_NONE = 0,
+  GAME_OVER_BOMB,
+  GAME_OVER_NO_MOVES
+} GameOverReason;
+
 // --- GLOBALS ---
 static Window *s_splash_window;
 static Layer *s_splash_layer;
-static int s_splash_selection = 0; // 0 = Play, 1 = Exit
+static int s_splash_selection = 0;
+static bool s_splash_touch_valid = false;
+
+static Window *s_help_window;
+static Layer *s_help_layer;
+static int s_help_page = 0;
 
 static Window *s_game_window;
 static Layer *s_grid_layer;
@@ -36,15 +47,18 @@ static GPath *s_hex_path;
 static uint8_t s_board[GRID_COLS][GRID_ROWS];
 static int8_t s_bomb_timers[GRID_COLS][GRID_ROWS];
 static bool s_game_over = false;
+static GameOverReason s_game_over_reason = GAME_OVER_NONE;
 static bool s_used_retry = false; 
-static bool s_is_cascading = false; 
+static bool s_is_cascading = false;
+static bool s_has_save = false;
+static bool s_game_active = false;
 static int s_score = 0; 
 
 // Timer Tracking
 static AppTimer *s_cascade_timer = NULL;
 
 // --- EXCLUSIVE HIGH-RES LAYOUT OFFSETS ---
-#if defined(PBL_ROUND)
+#if defined(PBL_PLATFORM_GABBRO)
 // Pebble Round 2 (Gabbro) - 260x260
 static const int s_hex_w = 32;
 static const int s_hex_h = 36;
@@ -55,7 +69,7 @@ static const GPathInfo HEX_PATH_INFO = {
   .num_points = 6,
   .points = (GPoint []) { {0, -18}, {16, -9}, {16, 9}, {0, 18}, {-16, 9}, {-16, -9} }
 };
-#else
+#elif defined(PBL_PLATFORM_EMERY)
 // Pebble Time 2 (Emery) - 200x228
 static const int s_hex_w = 30;
 static const int s_hex_h = 34;
@@ -66,9 +80,12 @@ static const GPathInfo HEX_PATH_INFO = {
   .num_points = 6,
   .points = (GPoint []) { {0, -17}, {15, -8}, {15, 8}, {0, 17}, {-15, 8}, {-15, -8} }
 };
+#else
+#error "PeXic only supports Emery and Gabbro"
 #endif
 
-#define MAX_CURSORS 100 
+// Dynamic array bound formulation protects memory even if grid size changes
+#define MAX_CURSORS (2 * (GRID_COLS - 1) * (GRID_ROWS - 1))
 static CursorPos s_cursors[MAX_CURSORS];
 static int s_cursor_count = 0;
 static int s_active_cursor_idx = 0;
@@ -92,11 +109,13 @@ static const int ODD_R_OFFSETS[6][2]  = {{0, -1}, {1, -1}, {-1, 0}, {1, 0}, {0, 
 
 // --- FORWARD DECLARATIONS ---
 static void trigger_cascade_check_callback(void *data);
-static void detect_matches_and_cascade();
-static bool has_valid_moves();
+static void detect_matches_and_cascade(void);
+static bool has_valid_moves(void);
 static bool board_has_any_match(uint8_t sim_board[GRID_COLS][GRID_ROWS]);
 static void game_select_click_handler(ClickRecognizerRef recognizer, void *context);
 static void game_back_click_handler(ClickRecognizerRef recognizer, void *context);
+static void splash_select_click_handler(ClickRecognizerRef recognizer, void *context);
+static void save_game_state(void);
 
 // --- UTILITIES & GRAPHICS ---
 static bool is_valid_coord(int q, int r) {
@@ -138,11 +157,14 @@ static void draw_hex(GContext *ctx, int x, int y, uint8_t val) {
   gpath_draw_filled(ctx, s_hex_path);
   graphics_context_set_stroke_color(ctx, GColorWhite);
   gpath_draw_outline(ctx, s_hex_path);
-  if (val == PIECE_SILVER_PEARL) graphics_fill_circle(ctx, GPoint(x, y), 4);
+  if (val == PIECE_SILVER_PEARL) {
+    graphics_context_set_fill_color(ctx, GColorWhite);
+    graphics_fill_circle(ctx, GPoint(x, y), 4);
+  }
 }
 
 // --- INITIALIZATION ---
-static void init_cursors() {
+static void init_cursors(void) {
   s_cursor_count = 0;
   for(int r = 0; r < GRID_ROWS - 1; r++) {
     for(int q = 0; q < GRID_COLS; q++) {
@@ -181,50 +203,116 @@ static void init_cursors() {
   }
 }
 
-static void init_board(bool force_reset) {
-  if (!force_reset && persist_exists(SAVE_KEY)) {
-    SaveState state;
-    persist_read_data(SAVE_KEY, &state, sizeof(SaveState));
-    if (state.version == SAVE_VERSION && !state.game_over) {
-      memcpy(s_board, state.board, sizeof(s_board));
-      memcpy(s_bomb_timers, state.bomb_timers, sizeof(s_bomb_timers));
-      s_score = state.score;
-      s_used_retry = state.used_retry;
-      s_is_cascading = false;
-      s_is_destructing = false;
-      s_game_over = false;
-      return;
-    }
+static void clear_saved_game(void) {
+  if (persist_exists(SAVE_KEY)) {
+    persist_delete(SAVE_KEY);
+  }
+  s_has_save = false;
+}
+
+static bool load_saved_game(void) {
+  if (!persist_exists(SAVE_KEY)) return false;
+
+  if (persist_get_size(SAVE_KEY) != (int)sizeof(SaveState)) {
+    clear_saved_game();
+    return false;
   }
 
-  s_score = 0; 
-  s_used_retry = false; 
-  
+  SaveState state;
+  int bytes_read = persist_read_data(SAVE_KEY, &state, sizeof(state));
+  if (bytes_read != (int)sizeof(state) ||
+      state.version != SAVE_VERSION ||
+      state.game_over) {
+    clear_saved_game();
+    return false;
+  }
+
+  memcpy(s_board, state.board, sizeof(s_board));
+  memcpy(s_bomb_timers, state.bomb_timers, sizeof(s_bomb_timers));
+  s_score = state.score;
+  s_used_retry = state.used_retry;
+  s_game_over = false;
+  s_game_over_reason = GAME_OVER_NONE;
+  s_is_animating = false;
+  s_is_cascading = false;
+  s_is_destructing = false;
+  memset(s_marked_for_deletion, 0, sizeof(s_marked_for_deletion));
+  memset(s_spawn_pearl, 0, sizeof(s_spawn_pearl));
+
+  s_has_save = true;
+  s_game_active = true;
+  return true;
+}
+
+static void save_game_state(void) {
+  if (!s_game_active || s_game_over) {
+    if (s_game_over) clear_saved_game();
+    return;
+  }
+
+  SaveState state = {
+    .version = SAVE_VERSION,
+    .score = s_score,
+    .game_over = false,
+    .used_retry = s_used_retry
+  };
+
+  memcpy(state.board, s_board, sizeof(s_board));
+  memcpy(state.bomb_timers, s_bomb_timers, sizeof(s_bomb_timers));
+
+  int bytes_written = persist_write_data(SAVE_KEY, &state, sizeof(state));
+  if (bytes_written == (int)sizeof(state)) {
+    s_has_save = true;
+  } else {
+    // Do not leave an older/stale save behind if the new write failed.
+    clear_saved_game();
+  }
+}
+
+static void init_board(bool force_reset) {
+  if (!force_reset && load_saved_game()) {
+    return;
+  }
+
+  s_score = 0;
+  s_used_retry = false;
+
   do {
     memset(s_board, 0, sizeof(s_board));
     memset(s_bomb_timers, 0, sizeof(s_bomb_timers));
 
-    for(int r = 0; r < GRID_ROWS; r++) {
-      for(int q = 0; q < GRID_COLS; q++) {
+    for (int r = 0; r < GRID_ROWS; r++) {
+      for (int q = 0; q < GRID_COLS; q++) {
         int color;
         bool valid;
-        
+
         do {
           valid = true;
           color = (rand() % 5) + 1;
           s_board[q][r] = color;
-          
+
           if (board_has_any_match(s_board)) {
             valid = false;
           }
         } while (!valid);
       }
     }
-  } while (!has_valid_moves()); 
-  
+  } while (!has_valid_moves());
+
+  s_is_animating = false;
   s_is_cascading = false;
   s_is_destructing = false;
   s_game_over = false;
+  s_game_over_reason = GAME_OVER_NONE;
+  memset(s_marked_for_deletion, 0, sizeof(s_marked_for_deletion));
+  memset(s_spawn_pearl, 0, sizeof(s_spawn_pearl));
+
+  if (force_reset) {
+    s_game_active = true;
+  } else {
+    s_game_active = false;
+    s_has_save = false;
+  }
 }
 
 // --- DESTRUCTION ANIMATION ---
@@ -240,51 +328,66 @@ static const AnimationImplementation s_destruct_anim_impl = {
   .teardown = anim_destruct_teardown_callback 
 };
 
-static void anim_destruct_stopped_callback(Animation *anim, bool finished, void *context) {
-  s_is_destructing = false;
-  
-  if (finished) {
-    for (int r = 0; r < GRID_ROWS; r++) {
-      for (int q = 0; q < GRID_COLS; q++) {
-        if (s_marked_for_deletion[q][r]) {
-          s_board[q][r] = 0; 
-          s_bomb_timers[q][r] = 0;
-          s_marked_for_deletion[q][r] = false;
-          s_score += 10; 
-        }
-        if (s_spawn_pearl[q][r]) {
-          s_board[q][r] = PIECE_SILVER_PEARL;
-          s_bomb_timers[q][r] = 0;
-          s_spawn_pearl[q][r] = false;
-          s_score += 50; 
-        }
+static void resolve_marked_pieces(void) {
+  for (int r = 0; r < GRID_ROWS; r++) {
+    for (int q = 0; q < GRID_COLS; q++) {
+      if (s_marked_for_deletion[q][r]) {
+        s_board[q][r] = 0;
+        s_bomb_timers[q][r] = 0;
+        s_marked_for_deletion[q][r] = false;
+        s_score += 10;
+      }
+      if (s_spawn_pearl[q][r]) {
+        s_board[q][r] = PIECE_SILVER_PEARL;
+        s_bomb_timers[q][r] = 0;
+        s_spawn_pearl[q][r] = false;
+        s_score += 50;
       }
     }
-    trigger_cascade_check_callback((void *)(intptr_t)1);
   }
-  
-  animation_destroy(s_destruct_anim); s_destruct_anim = NULL;
 }
 
-static void start_destruct_animation() {
-  if (s_is_destructing) return; 
+static void anim_destruct_stopped_callback(Animation *anim, bool finished, void *context) {
+  s_is_destructing = false;
+
+  if (finished) {
+    resolve_marked_pieces();
+    trigger_cascade_check_callback((void *)(intptr_t)1);
+  }
+
+  animation_destroy(s_destruct_anim);
+  s_destruct_anim = NULL;
+}
+
+static void start_destruct_animation(void) {
+  if (s_is_destructing) return;
   s_is_destructing = true;
   s_current_destruct_radius = s_destruct_max;
-  
+
   s_destruct_anim = animation_create();
-  animation_set_duration(s_destruct_anim, 250); 
-  animation_set_curve(s_destruct_anim, AnimationCurveEaseIn); 
+  if (!s_destruct_anim) {
+    s_is_destructing = false;
+    resolve_marked_pieces();
+    trigger_cascade_check_callback((void *)(intptr_t)1);
+    return;
+  }
+
+  animation_set_duration(s_destruct_anim, 250);
+  animation_set_curve(s_destruct_anim, AnimationCurveEaseIn);
   animation_set_implementation(s_destruct_anim, &s_destruct_anim_impl);
   animation_set_handlers(s_destruct_anim, (AnimationHandlers) { .stopped = anim_destruct_stopped_callback }, NULL);
-  
+
   animation_schedule(s_destruct_anim);
 }
 
 // --- MATCH DETECTION ---
-static bool detect_matches() {
-  bool matches_found = false;
+static void clear_resolution_marks(void) {
   memset(s_marked_for_deletion, 0, sizeof(s_marked_for_deletion));
   memset(s_spawn_pearl, 0, sizeof(s_spawn_pearl));
+}
+
+static bool detect_matches(void) {
+  bool matches_found = false;
 
   for (int i = 0; i < s_cursor_count; i++) {
     CursorPos c = s_cursors[i];
@@ -302,10 +405,8 @@ static bool detect_matches() {
   return matches_found; 
 }
 
-static bool detect_flowers() {
+static bool detect_flowers(void) {
   bool flower_found = false;
-  memset(s_marked_for_deletion, 0, sizeof(s_marked_for_deletion));
-  memset(s_spawn_pearl, 0, sizeof(s_spawn_pearl));
 
   for (int r = 0; r < GRID_ROWS; r++) {
     for (int q = 0; q < GRID_COLS; q++) {
@@ -365,7 +466,7 @@ static bool board_has_any_match(uint8_t sim_board[GRID_COLS][GRID_ROWS]) {
   return false;
 }
 
-static bool has_valid_moves() {
+static bool has_valid_moves(void) {
   uint8_t sim_board[GRID_COLS][GRID_ROWS];
 
   for (int i = 0; i < s_cursor_count; i++) {
@@ -384,7 +485,7 @@ static bool has_valid_moves() {
 }
 
 // --- GRAVITY & CASCADES ---
-static void apply_gravity() {
+static void apply_gravity(void) {
   for (int q = 0; q < GRID_COLS; q++) {
     for (int r = GRID_ROWS - 1; r >= 0; r--) {
       if (s_board[q][r] == 0) {
@@ -426,18 +527,21 @@ static void apply_gravity() {
   layer_mark_dirty(s_grid_layer);
 }
 
-static void detect_matches_and_cascade() {
+static void detect_matches_and_cascade(void) {
+  clear_resolution_marks();
   bool made_flower = detect_flowers();
-  bool made_match = (!made_flower) ? detect_matches() : false;
-  
+  bool made_match = detect_matches();
+
   if (made_flower || made_match) {
-    s_is_cascading = true; 
-    start_destruct_animation(); 
+    s_is_cascading = true;
+    start_destruct_animation();
   } else {
-    s_is_cascading = false; 
+    s_is_cascading = false;
     if (!has_valid_moves()) {
       s_game_over = true;
-      layer_mark_dirty(s_grid_layer);
+      s_game_over_reason = GAME_OVER_NO_MOVES;
+      clear_saved_game();
+      if (s_grid_layer) layer_mark_dirty(s_grid_layer);
     }
   }
 }
@@ -467,14 +571,15 @@ static void rotate_cluster(int cursor_idx, bool clockwise) {
   }
 }
 
-static void tick_bombs() {
+static void tick_bombs(void) {
   for(int r = 0; r < GRID_ROWS; r++) {
     for(int q = 0; q < GRID_COLS; q++) {
       if (s_bomb_timers[q][r] > 0) {
         // Prevent unfair Game Overs: Don't explode a bomb if it is already caught in a match
-        if (!s_marked_for_deletion[q][r]) {
+        if (!s_marked_for_deletion[q][r] && !s_spawn_pearl[q][r]) {
           if (--s_bomb_timers[q][r] == 0) {
             s_game_over = true;
+            s_game_over_reason = GAME_OVER_BOMB;
             s_bomb_timers[q][r] = -1; 
           }
         }
@@ -498,44 +603,69 @@ static const AnimationImplementation s_anim_impl = {
   .teardown = anim_teardown_callback 
 };
 
+static void resolve_player_turn_after_rotation(void) {
+  clear_resolution_marks();
+  bool made_flower = detect_flowers();
+  bool made_match = detect_matches();
+
+  // Matches are identified before bombs tick, so any bomb being cleared
+  // (or converted into a pearl) cannot unfairly explode on the same move.
+  tick_bombs();
+
+  if (s_game_over) {
+    s_is_cascading = false;
+    clear_saved_game();
+    if (s_grid_layer) layer_mark_dirty(s_grid_layer);
+    return;
+  }
+
+  if (made_flower || made_match) {
+    s_is_cascading = true;
+    start_destruct_animation();
+  } else {
+    s_is_cascading = false;
+    if (!has_valid_moves()) {
+      s_game_over = true;
+      s_game_over_reason = GAME_OVER_NO_MOVES;
+      clear_saved_game();
+    }
+    if (s_grid_layer) layer_mark_dirty(s_grid_layer);
+  }
+}
+
 static void anim_stopped_callback(Animation *anim, bool finished, void *context) {
   s_is_animating = false;
   s_current_anim_pop = 0;
-  
+
   if (finished) {
     rotate_cluster(s_active_cursor_idx, s_anim_clockwise);
-    
-    // Evaluate matches FIRST, then tick bombs, so players aren't killed unfairly
-    bool made_flower = detect_flowers();
-    bool made_match = (!made_flower) ? detect_matches() : false;
-    
-    tick_bombs();
-    
-    if (made_flower || made_match) {
-      s_is_cascading = true; 
-      start_destruct_animation(); 
-    } else {
-      s_is_cascading = false; 
-      if (!s_game_over && !has_valid_moves()) {
-        s_game_over = true;
-      }
-      layer_mark_dirty(s_grid_layer);
-    }
+    resolve_player_turn_after_rotation();
   }
-  
-  animation_destroy(s_rotation_anim); s_rotation_anim = NULL;
+
+  animation_destroy(s_rotation_anim);
+  s_rotation_anim = NULL;
 }
 
 static void start_rotation_animation(bool clockwise) {
-  if (s_is_animating || s_is_cascading || s_game_over || s_is_destructing) return; 
-  s_is_animating = true; s_anim_clockwise = clockwise; s_current_anim_angle = 0; s_current_anim_pop = 0;
-  
+  if (s_is_animating || s_is_cascading || s_game_over || s_is_destructing) return;
+  s_is_animating = true;
+  s_anim_clockwise = clockwise;
+  s_current_anim_angle = 0;
+  s_current_anim_pop = 0;
+
   s_rotation_anim = animation_create();
-  animation_set_duration(s_rotation_anim, 350); 
-  animation_set_curve(s_rotation_anim, AnimationCurveEaseOut); 
+  if (!s_rotation_anim) {
+    s_is_animating = false;
+    rotate_cluster(s_active_cursor_idx, s_anim_clockwise);
+    resolve_player_turn_after_rotation();
+    return;
+  }
+
+  animation_set_duration(s_rotation_anim, 350);
+  animation_set_curve(s_rotation_anim, AnimationCurveEaseOut);
   animation_set_implementation(s_rotation_anim, &s_anim_impl);
   animation_set_handlers(s_rotation_anim, (AnimationHandlers) { .stopped = anim_stopped_callback }, NULL);
-  
+
   animation_schedule(s_rotation_anim);
 }
 
@@ -562,55 +692,208 @@ static void handle_touch_event(int touch_x, int touch_y) {
   }
 }
 
+// --- SPLASH / HELP MENU HELPERS ---
+static int splash_menu_count(void) {
+  return s_has_save ? 4 : 3;
+}
+
+static const char *splash_menu_label(int index) {
+  if (s_has_save) {
+    switch (index) {
+      case 0: return "CONTINUE";
+      case 1: return "NEW GAME";
+      case 2: return "HOW TO PLAY";
+      case 3: return "EXIT";
+      default: return "";
+    }
+  }
+
+  switch (index) {
+    case 0: return "PLAY GAME";
+    case 1: return "HOW TO PLAY";
+    case 2: return "EXIT";
+    default: return "";
+  }
+}
+
+static int splash_menu_start_y(GRect bounds) {
+  int cy = bounds.size.h / 4;
+#if defined(PBL_PLATFORM_GABBRO)
+  cy += 15;
+#endif
+  int title_y = cy + (s_hex_h / 2) + 5;
+  return title_y + (s_has_save ? 36 : 45);
+}
+
+static int splash_menu_row_step(void) {
+  return s_has_save ? 29 : 35;
+}
+
+static int splash_menu_box_height(void) {
+  return s_has_save ? 25 : 30;
+}
+
+static void start_new_game(void) {
+  clear_saved_game();
+  init_board(true);
+  s_game_active = true;
+  s_active_cursor_idx = s_cursor_count / 2;
+  window_stack_push(s_game_window, true);
+}
+
+static void continue_game(void) {
+  if (!s_has_save) {
+    start_new_game();
+    return;
+  }
+
+  s_game_active = true;
+  window_stack_push(s_game_window, true);
+}
+
+static void show_how_to_play(void) {
+  s_help_page = 0;
+  window_stack_push(s_help_window, true);
+}
+
+static void activate_splash_selection(void) {
+  if (s_has_save) {
+    switch (s_splash_selection) {
+      case 0: continue_game(); break;
+      case 1: start_new_game(); break;
+      case 2: show_how_to_play(); break;
+      default: window_stack_pop_all(true); break;
+    }
+  } else {
+    switch (s_splash_selection) {
+      case 0: start_new_game(); break;
+      case 1: show_how_to_play(); break;
+      default: window_stack_pop_all(true); break;
+    }
+  }
+}
+
 // --- SPLASH SCREEN RENDER ---
 static void splash_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
   int cx = bounds.size.w / 2;
   int cy = bounds.size.h / 4;
-#if defined(PBL_ROUND)
-  cy += 15; // Shift logo down slightly to avoid the Gabbro top hardware curve
+#if defined(PBL_PLATFORM_GABBRO)
+  cy += 15;
 #endif
-  
+
   int title_y = cy + (s_hex_h / 2) + 5;
-  int menu_y = title_y + 45;
+  int menu_y = splash_menu_start_y(bounds);
+  int row_step = splash_menu_row_step();
+  int box_h = splash_menu_box_height();
+  int count = splash_menu_count();
 
-  // Draw 3 connected logo hexes
   graphics_context_set_antialiased(ctx, true);
-  draw_hex(ctx, cx, cy - s_hex_h*3/8, 2); 
-  draw_hex(ctx, cx - s_hex_w/2, cy + s_hex_h*3/8, 1); 
-  draw_hex(ctx, cx + s_hex_w/2, cy + s_hex_h*3/8, 3); 
+  draw_hex(ctx, cx, cy - s_hex_h * 3 / 8, 2);
+  draw_hex(ctx, cx - s_hex_w / 2, cy + s_hex_h * 3 / 8, 1);
+  draw_hex(ctx, cx + s_hex_w / 2, cy + s_hex_h * 3 / 8, 3);
 
-  // Title
   graphics_context_set_text_color(ctx, GColorWhite);
-  graphics_draw_text(ctx, "PeXic", fonts_get_system_font(FONT_KEY_BITHAM_30_BLACK), GRect(0, title_y, bounds.size.w, 40), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  graphics_draw_text(ctx, "PeXic", fonts_get_system_font(FONT_KEY_BITHAM_30_BLACK),
+                     GRect(0, title_y, bounds.size.w, 40),
+                     GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
 
-  // Menu: PLAY
-  if (s_splash_selection == 0) {
-    graphics_context_set_fill_color(ctx, GColorWhite);
-    graphics_fill_rect(ctx, GRect(bounds.size.w/2 - 50, menu_y, 100, 30), 4, GCornersAll);
-    graphics_context_set_text_color(ctx, GColorBlack);
-  } else {
-    graphics_context_set_text_color(ctx, GColorWhite);
-  }
-  graphics_draw_text(ctx, "PLAY", fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD), GRect(0, menu_y-2, bounds.size.w, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  for (int i = 0; i < count; i++) {
+    int y = menu_y + i * row_step;
+    bool selected = (i == s_splash_selection);
 
-  // Menu: EXIT
-  menu_y += 35;
-  if (s_splash_selection == 1) {
-    graphics_context_set_fill_color(ctx, GColorWhite);
-    graphics_fill_rect(ctx, GRect(bounds.size.w/2 - 50, menu_y, 100, 30), 4, GCornersAll);
-    graphics_context_set_text_color(ctx, GColorBlack);
-  } else {
-    graphics_context_set_text_color(ctx, GColorWhite);
+    if (selected) {
+      graphics_context_set_fill_color(ctx, GColorWhite);
+      graphics_fill_rect(ctx, GRect(bounds.size.w / 2 - 62, y, 124, box_h), 4, GCornersAll);
+      graphics_context_set_text_color(ctx, GColorBlack);
+    } else {
+      graphics_context_set_text_color(ctx, GColorWhite);
+    }
+
+    graphics_draw_text(ctx, splash_menu_label(i),
+                       fonts_get_system_font(s_has_save ? FONT_KEY_GOTHIC_18_BOLD : FONT_KEY_GOTHIC_24_BOLD),
+                       GRect(0, y - 2, bounds.size.w, box_h + 3),
+                       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
   }
-  graphics_draw_text(ctx, "EXIT", fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD), GRect(0, menu_y-2, bounds.size.w, 30), GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+}
+
+// --- HOW TO PLAY RENDER ---
+static void help_update_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+#if defined(PBL_PLATFORM_GABBRO)
+  const int side_margin = 28;
+  const int top = 22;
+#else
+  const int side_margin = 10;
+  const int top = 8;
+#endif
+
+  graphics_context_set_text_color(ctx, GColorWhite);
+  graphics_draw_text(ctx, "HOW TO PLAY", fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD),
+                     GRect(side_margin, top, bounds.size.w - side_margin * 2, 30),
+                     GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+  GFont help_font = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+
+  if (s_help_page == 0) {
+    graphics_draw_text(ctx,
+      "CONTROLS\n\n"
+      "UP / DOWN: Move cluster\n"
+      "SELECT: Rotate clockwise\n"
+      "HOLD SELECT: Rotate counter-clockwise\n\n"
+      "TOUCH\n"
+      "Tap a cluster to select it.\n"
+      "Tap the selected cluster to rotate.",
+      help_font,
+      GRect(side_margin, top + 32, bounds.size.w - side_margin * 2, bounds.size.h - top - 55),
+      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+    graphics_draw_text(ctx, "SELECT / TAP >", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                       GRect(side_margin, bounds.size.h - 24, bounds.size.w - side_margin * 2, 20),
+                       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  } else {
+    graphics_draw_text(ctx,
+      "GOAL\n\n"
+      "Rotate groups of 3 hexes.\n"
+      "Match 3 of one color in a triangle to clear them.\n\n"
+      "Surround a center hex with 6 matching pieces to make a SILVER PEARL.\n\n"
+      "Bombs count down each move. Clear them before 0!\n"
+      "No moves or an exploding bomb ends the game.",
+      help_font,
+      GRect(side_margin, top + 32, bounds.size.w - side_margin * 2, bounds.size.h - top - 55),
+      GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+
+    graphics_draw_text(ctx, "SELECT / TAP TO RETURN", fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD),
+                       GRect(side_margin, bounds.size.h - 24, bounds.size.w - side_margin * 2, 20),
+                       GTextOverflowModeWordWrap, GTextAlignmentCenter, NULL);
+  }
+}
+
+static void help_advance(void) {
+  if (s_help_page == 0) {
+    s_help_page = 1;
+    if (s_help_layer) layer_mark_dirty(s_help_layer);
+  } else {
+    window_stack_pop(true);
+  }
+}
+
+static void help_back(void) {
+  if (s_help_page == 1) {
+    s_help_page = 0;
+    if (s_help_layer) layer_mark_dirty(s_help_layer);
+  } else {
+    window_stack_pop(true);
+  }
 }
 
 // --- GLOBAL TOUCH HANDLER ---
 #if defined(PBL_TOUCH)
 static void touch_handler(const TouchEvent *event, void *context) {
-  if (window_stack_get_top_window() == s_game_window) {
+  Window *top = window_stack_get_top_window();
+
+  if (top == s_game_window) {
     if (event->type == TouchEvent_Touchdown) {
       if (s_game_over) {
         int mid_y = layer_get_bounds(s_grid_layer).size.h / 2;
@@ -623,14 +906,33 @@ static void touch_handler(const TouchEvent *event, void *context) {
       }
       handle_touch_event(event->x, event->y);
     }
-  } else if (window_stack_get_top_window() == s_splash_window) {
+  } else if (top == s_splash_window) {
     if (event->type == TouchEvent_Touchdown) {
-      int threshold = layer_get_bounds(s_splash_layer).size.h / 2 + 30;
-      s_splash_selection = (event->y < threshold) ? 0 : 1;
-      layer_mark_dirty(s_splash_layer);
+      s_splash_touch_valid = false;
+      GRect bounds = layer_get_bounds(s_splash_layer);
+      int menu_y = splash_menu_start_y(bounds);
+      int row_step = splash_menu_row_step();
+      int box_h = splash_menu_box_height();
+      int count = splash_menu_count();
+
+      for (int i = 0; i < count; i++) {
+        int y = menu_y + i * row_step;
+        if (event->y >= y - 3 && event->y <= y + box_h + 3) {
+          s_splash_selection = i;
+          s_splash_touch_valid = true;
+          layer_mark_dirty(s_splash_layer);
+          break;
+        }
+      }
     } else if (event->type == TouchEvent_Liftoff) {
-      if (s_splash_selection == 0) window_stack_push(s_game_window, true);
-      else window_stack_pop_all(true);
+      if (s_splash_touch_valid) {
+        s_splash_touch_valid = false;
+        activate_splash_selection();
+      }
+    }
+  } else if (top == s_help_window) {
+    if (event->type == TouchEvent_Touchdown) {
+      help_advance();
     }
   }
 }
@@ -638,19 +940,51 @@ static void touch_handler(const TouchEvent *event, void *context) {
 
 // --- SPLASH MENU CONTROLS ---
 static void splash_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_splash_selection = 0; layer_mark_dirty(s_splash_layer);
+  int count = splash_menu_count();
+  if (s_splash_selection > 0) s_splash_selection--;
+  else s_splash_selection = count - 1;
+  layer_mark_dirty(s_splash_layer);
 }
+
 static void splash_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_splash_selection = 1; layer_mark_dirty(s_splash_layer);
+  int count = splash_menu_count();
+  if (s_splash_selection < count - 1) s_splash_selection++;
+  else s_splash_selection = 0;
+  layer_mark_dirty(s_splash_layer);
 }
+
 static void splash_select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (s_splash_selection == 0) window_stack_push(s_game_window, true);
-  else window_stack_pop_all(true);
+  activate_splash_selection();
 }
+
 static void splash_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, splash_up_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN, splash_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, splash_select_click_handler);
+}
+
+// --- HOW TO PLAY CONTROLS ---
+static void help_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  help_advance();
+}
+
+static void help_up_click_handler(ClickRecognizerRef recognizer, void *context) {
+  help_back();
+}
+
+static void help_down_click_handler(ClickRecognizerRef recognizer, void *context) {
+  help_advance();
+}
+
+static void help_back_click_handler(ClickRecognizerRef recognizer, void *context) {
+  help_back();
+}
+
+static void help_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_UP, help_up_click_handler);
+  window_single_click_subscribe(BUTTON_ID_DOWN, help_down_click_handler);
+  window_single_click_subscribe(BUTTON_ID_SELECT, help_select_click_handler);
+  window_single_click_subscribe(BUTTON_ID_BACK, help_back_click_handler);
 }
 
 // --- GAME MENU CONTROLS ---
@@ -671,28 +1005,61 @@ static void game_down_click_handler(ClickRecognizerRef recognizer, void *context
 static void game_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_game_over) {
     if (!s_used_retry) {
-      s_used_retry = true;
-      s_game_over = false;
-      for(int r = 0; r < GRID_ROWS; r++) {
-        for(int q = 0; q < GRID_COLS; q++) {
-          if (s_bomb_timers[q][r] == -1 || (s_bomb_timers[q][r] > 0 && s_bomb_timers[q][r] <= 5)) {
-            s_bomb_timers[q][r] = 10;
+      // A bomb death and a dead board can happen on the same turn, so base
+      // retry behavior on the board's actual playability, not just the
+      // recorded Game Over reason.
+      bool board_is_dead = !has_valid_moves();
+
+      if (board_is_dead) {
+        // Fresh playable board, but preserve the player's score.
+        int saved_score = s_score;
+        init_board(true);
+        s_score = saved_score;
+        s_used_retry = true;
+        s_active_cursor_idx = s_cursor_count / 2;
+      } else {
+        // Bomb-only retry: preserve the existing playable board.
+        s_used_retry = true;
+        s_game_over = false;
+        s_game_active = true;
+
+        for (int r = 0; r < GRID_ROWS; r++) {
+          for (int q = 0; q < GRID_COLS; q++) {
+            if (s_bomb_timers[q][r] == -1 ||
+                (s_bomb_timers[q][r] > 0 &&
+                 s_bomb_timers[q][r] <= 5)) {
+              s_bomb_timers[q][r] = 10;
+            }
           }
         }
       }
+
+      s_game_over = false;
+      s_game_over_reason = GAME_OVER_NONE;
+      s_game_active = true;
     } else {
-      init_board(true); 
+      init_board(true);
+      s_active_cursor_idx = s_cursor_count / 2;
+      s_game_active = true;
+      s_game_over_reason = GAME_OVER_NONE;
     }
+
     layer_mark_dirty(s_grid_layer);
     return;
   }
+
   start_rotation_animation(true);
 }
 static void game_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
   start_rotation_animation(false);
 }
 static void game_back_click_handler(ClickRecognizerRef recognizer, void *context) {
-  window_stack_pop(true); 
+  if (!s_game_over) {
+    save_game_state();
+  } else {
+    clear_saved_game();
+  }
+  window_stack_pop(true);
 }
 static void game_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, game_up_click_handler);
@@ -712,7 +1079,7 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
   for (int r = -2; r < GRID_ROWS + 2; r++) {
     for (int q = -2; q < GRID_COLS + 2; q++) {
       if (q >= 0 && q < GRID_COLS && r >= 0 && r < GRID_ROWS) continue; 
-      int x = s_x_off + q * s_hex_w + (r % 2) * (s_hex_w / 2);
+      int x = s_x_off + q * s_hex_w + ((r % 2) != 0) * (s_hex_w / 2);
       int y = s_y_off + r * (s_hex_h * 3 / 4);
       gpath_move_to(s_hex_path, GPoint(x, y));
       graphics_context_set_fill_color(ctx, get_dummy_color(q, r));
@@ -729,7 +1096,7 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
       bool is_anim_hex = s_is_animating && ((q==c.hex_a.q && r==c.hex_a.r) || (q==c.hex_b.q && r==c.hex_b.r) || (q==c.hex_c.q && r==c.hex_c.r));
       if (is_anim_hex) continue; 
 
-      int x = s_x_off + q * s_hex_w + (r % 2) * (s_hex_w / 2);
+      int x = s_x_off + q * s_hex_w + ((r % 2) != 0) * (s_hex_w / 2);
       int y = s_y_off + r * (s_hex_h * 3 / 4);
 
       if (s_is_destructing && s_marked_for_deletion[q][r]) {
@@ -737,7 +1104,7 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
         graphics_fill_circle(ctx, GPoint(x, y), s_current_destruct_radius);
         graphics_context_set_stroke_width(ctx, 2);
         graphics_context_set_stroke_color(ctx, GColorWhite);
-#if defined(PBL_ROUND)
+#if defined(PBL_PLATFORM_GABBRO)
         graphics_draw_circle(ctx, GPoint(x, y), 18 - s_current_destruct_radius + 2);
 #else
         graphics_draw_circle(ctx, GPoint(x, y), 16 - s_current_destruct_radius + 2);
@@ -839,7 +1206,7 @@ static void grid_update_proc(Layer *layer, GContext *ctx) {
 
   // 5. Draw the Black Score Header
   graphics_context_set_fill_color(ctx, GColorBlack);
-#if defined(PBL_ROUND)
+#if defined(PBL_PLATFORM_GABBRO)
   graphics_fill_circle(ctx, GPoint(bounds.size.w / 2, -(bounds.size.w / 2) + 26), bounds.size.w / 2);
   int score_y = 6;
 #else
@@ -884,11 +1251,30 @@ static void splash_window_load(Window *window) {
 }
 
 static void splash_window_appear(Window *window) {
+  int count = splash_menu_count();
+  if (s_splash_selection >= count) s_splash_selection = 0;
   layer_mark_dirty(s_splash_layer);
 }
 
 static void splash_window_unload(Window *window) {
   layer_destroy(s_splash_layer);
+  s_splash_layer = NULL;
+}
+
+static void help_window_load(Window *window) {
+  Layer *window_layer = window_get_root_layer(window);
+  s_help_layer = layer_create(layer_get_bounds(window_layer));
+  layer_set_update_proc(s_help_layer, help_update_proc);
+  layer_add_child(window_layer, s_help_layer);
+}
+
+static void help_window_appear(Window *window) {
+  if (s_help_layer) layer_mark_dirty(s_help_layer);
+}
+
+static void help_window_unload(Window *window) {
+  layer_destroy(s_help_layer);
+  s_help_layer = NULL;
 }
 
 static void game_window_load(Window *window) {
@@ -899,7 +1285,19 @@ static void game_window_load(Window *window) {
 }
 
 static void game_window_appear(Window *window) {
-  layer_mark_dirty(s_grid_layer); 
+  // Returning from the title can happen after an animation/cascade was
+  // interrupted by Back. Re-detect the logical board instead of trying to
+  // persist transient animation state.
+  s_is_animating = false;
+  s_is_destructing = false;
+  s_is_cascading = false;
+  clear_resolution_marks();
+
+  if (s_game_active && !s_game_over) {
+    detect_matches_and_cascade();
+  }
+
+  if (s_grid_layer) layer_mark_dirty(s_grid_layer);
 }
 
 static void game_window_unload(Window *window) {
@@ -907,24 +1305,31 @@ static void game_window_unload(Window *window) {
     app_timer_cancel(s_cascade_timer);
     s_cascade_timer = NULL;
   }
+
   if (s_rotation_anim) {
     animation_unschedule(s_rotation_anim);
   }
+
   if (s_destruct_anim) {
     animation_unschedule(s_destruct_anim);
   }
+
+  s_is_animating = false;
+  s_is_destructing = false;
+  s_is_cascading = false;
+  clear_resolution_marks();
+
   layer_destroy(s_grid_layer);
+  s_grid_layer = NULL;
 }
 
-static void init() {
-  srand(time(NULL)); 
-  
-  // Set up Hex Path once
+static void init(void) {
+  srand(time(NULL));
+
   s_hex_path = gpath_create(&HEX_PATH_INFO);
-  
-  // Initialize game state (Runs exactly once to prevent overwriting saves mid-session)
-  init_cursors(); 
-  init_board(false); 
+
+  init_cursors();
+  init_board(false);
   s_active_cursor_idx = s_cursor_count / 2;
 
   // Splash Window
@@ -936,7 +1341,17 @@ static void init() {
     .unload = splash_window_unload
   });
   window_set_click_config_provider(s_splash_window, splash_click_config_provider);
-  
+
+  // How To Play Window
+  s_help_window = window_create();
+  window_set_background_color(s_help_window, GColorOxfordBlue);
+  window_set_window_handlers(s_help_window, (WindowHandlers) {
+    .load = help_window_load,
+    .appear = help_window_appear,
+    .unload = help_window_unload
+  });
+  window_set_click_config_provider(s_help_window, help_click_config_provider);
+
   // Game Window
   s_game_window = window_create();
   window_set_background_color(s_game_window, GColorOxfordBlue);
@@ -948,42 +1363,42 @@ static void init() {
   window_set_click_config_provider(s_game_window, game_click_config_provider);
 
   window_stack_push(s_splash_window, true);
-  
+
 #if defined(PBL_TOUCH)
   touch_service_subscribe(touch_handler, NULL);
 #endif
 }
 
-static void deinit() { 
+static void deinit(void) {
   if (s_cascade_timer) {
     app_timer_cancel(s_cascade_timer);
     s_cascade_timer = NULL;
   }
+
   if (s_rotation_anim) {
     animation_unschedule(s_rotation_anim);
   }
+
   if (s_destruct_anim) {
     animation_unschedule(s_destruct_anim);
   }
 
-  // Save the progress
-  SaveState state = {
-    .version = SAVE_VERSION,
-    .score = s_score,
-    .game_over = s_game_over,
-    .used_retry = s_used_retry
-  };
-  memcpy(state.board, s_board, sizeof(s_board));
-  memcpy(state.bomb_timers, s_bomb_timers, sizeof(s_bomb_timers));
-  persist_write_data(SAVE_KEY, &state, sizeof(SaveState));
-
-  gpath_destroy(s_hex_path);
+  // Back-to-title saves explicitly, but this is a final safety net if the
+  // app is closed while a live game is on screen.
+  save_game_state();
 
 #if defined(PBL_TOUCH)
   touch_service_unsubscribe();
 #endif
-  window_destroy(s_game_window); 
-  window_destroy(s_splash_window); 
+
+  if (s_game_window) window_destroy(s_game_window);
+  if (s_help_window) window_destroy(s_help_window);
+  if (s_splash_window) window_destroy(s_splash_window);
+  if (s_hex_path) gpath_destroy(s_hex_path);
 }
 
-int main(void) { init(); app_event_loop(); deinit(); }
+int main(void) {
+  init();
+  app_event_loop();
+  deinit();
+}
