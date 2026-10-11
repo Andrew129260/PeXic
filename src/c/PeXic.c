@@ -693,6 +693,15 @@ static void handle_touch_event(int touch_x, int touch_y) {
 }
 
 // --- SPLASH / HELP MENU HELPERS ---
+
+static int splash_get_cy(GRect bounds) {
+#if defined(PBL_PLATFORM_GABBRO)
+  return (bounds.size.h / 4) + 5; // Shifted logo slightly higher
+#else
+  return bounds.size.h / 6; // Shift logo higher on Emery to create breathing room for buttons
+#endif
+}
+
 static int splash_menu_count(void) {
   return s_has_save ? 4 : 3;
 }
@@ -717,20 +726,18 @@ static const char *splash_menu_label(int index) {
 }
 
 static int splash_menu_start_y(GRect bounds) {
-  int cy = bounds.size.h / 4;
-#if defined(PBL_PLATFORM_GABBRO)
-  cy += 15;
-#endif
+  int cy = splash_get_cy(bounds);
   int title_y = cy + (s_hex_h / 2) + 5;
-  return title_y + (s_has_save ? 36 : 45);
+  // Adjusted offset pulls the menu down away from the raised logo
+  return title_y + (s_has_save ? 42 : 54); 
 }
 
 static int splash_menu_row_step(void) {
-  return s_has_save ? 29 : 35;
+  return s_has_save ? 32 : 40;
 }
 
 static int splash_menu_box_height(void) {
-  return s_has_save ? 25 : 30;
+  return s_has_save ? 26 : 32;
 }
 
 static void start_new_game(void) {
@@ -778,12 +785,9 @@ static void splash_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
 
   int cx = bounds.size.w / 2;
-  int cy = bounds.size.h / 4;
-#if defined(PBL_PLATFORM_GABBRO)
-  cy += 15;
-#endif
-
+  int cy = splash_get_cy(bounds);
   int title_y = cy + (s_hex_h / 2) + 5;
+
   int menu_y = splash_menu_start_y(bounds);
   int row_step = splash_menu_row_step();
   int box_h = splash_menu_box_height();
@@ -914,10 +918,13 @@ static void touch_handler(const TouchEvent *event, void *context) {
       int row_step = splash_menu_row_step();
       int box_h = splash_menu_box_height();
       int count = splash_menu_count();
+      
+      // Expand tap targets dynamically to fill the gaps between buttons
+      int tap_padding = (row_step - box_h) / 2;
 
       for (int i = 0; i < count; i++) {
         int y = menu_y + i * row_step;
-        if (event->y >= y - 3 && event->y <= y + box_h + 3) {
+        if (event->y >= y - tap_padding && event->y <= y + box_h + tap_padding) {
           s_splash_selection = i;
           s_splash_touch_valid = true;
           layer_mark_dirty(s_splash_layer);
@@ -1031,6 +1038,14 @@ static void game_select_click_handler(ClickRecognizerRef recognizer, void *conte
               s_bomb_timers[q][r] = 10;
             }
           }
+        }
+        
+        // EDGE CASE FIX: Ensure the preserved board is actually playable
+        if (!has_valid_moves()) {
+          int saved_score = s_score;
+          init_board(true);
+          s_score = saved_score;
+          s_active_cursor_idx = s_cursor_count / 2;
         }
       }
 
